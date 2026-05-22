@@ -64,6 +64,57 @@ def dist(a: Tuple[float, float], b: Tuple[float, float]) -> float:
     return math.sqrt((b[0] - a[0]) ** 2 + (b[1] - a[1]) ** 2)
 
 
+def simplify_polygon(pts: List[Tuple[float, float]], epsilon: float = 8.0) -> List[Tuple[float, float]]:
+    """Reduce polygon vertex count with the Ramer-Douglas-Peucker algorithm."""
+    if len(pts) < 4 or epsilon <= 0:
+        return pts
+
+    closed = pts[:]
+    if closed[0] == closed[-1]:
+        closed = closed[:-1]
+
+    def point_line_distance(point: Tuple[float, float], start: Tuple[float, float], end: Tuple[float, float]) -> float:
+        if start == end:
+            return dist(point, start)
+
+        x0, y0 = point
+        x1, y1 = start
+        x2, y2 = end
+        numerator = abs((y2 - y1) * x0 - (x2 - x1) * y0 + x2 * y1 - y2 * x1)
+        denominator = math.sqrt((y2 - y1) ** 2 + (x2 - x1) ** 2)
+        return numerator / denominator if denominator else 0.0
+
+    def rdp(points: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
+        if len(points) <= 2:
+            return points
+
+        max_distance = -1.0
+        split_index = 0
+        start = points[0]
+        end = points[-1]
+
+        for index in range(1, len(points) - 1):
+            distance = point_line_distance(points[index], start, end)
+            if distance > max_distance:
+                max_distance = distance
+                split_index = index
+
+        if max_distance > epsilon:
+            left = rdp(points[: split_index + 1])
+            right = rdp(points[split_index:])
+            return left[:-1] + right
+        return [start, end]
+
+    simplified = rdp(closed)
+    if len(simplified) >= 3 and simplified[0] != simplified[-1]:
+        simplified.append(simplified[0])
+
+    if len(simplified) > 1 and simplified[0] == simplified[-1]:
+        simplified = simplified[:-1]
+
+    return simplified if len(simplified) >= 3 else pts
+
+
 def inset_polygon(pts: List[Tuple[float, float]], d: float) -> List[Tuple[float, float]]:
     """
     Inset (shrink) a polygon by distance d using averaged edge normals.

@@ -15,6 +15,8 @@ import pandas as pd
 from utils.models import LocationData, Obstacle
 from utils.irradiance import MALAYSIAN_LOCATIONS, DEFAULT_PANEL_SPEC, GRID_EMISSION_FACTOR, AVG_TARIFF_RM
 from utils.optimization import optimize_layout
+from utils.geometry import simplify_polygon
+from utils.roof_segmenter import segment_roof_facets
 
 
 # ── Page Config ──────────────────────────────────────────────────────────────
@@ -106,12 +108,15 @@ def init_state():
         "rotation": 0,
         "flip_h": False,
         "flip_v": False,
+        "rf_confidence_threshold": 35,
         "scale_mode": "two_point",
         "pixels_per_meter": None,
         "manual_ppm": 50.0,
         "scale_points": [],
         "scale_distance": 10.0,
         "roof_points": [],
+        "pending_ai_roof_points": [],
+        "ai_boundary_selected": False,
         "obstacles": [],
         "result": None,
         "drawing_mode": "polygon",   # polygon | obstacle | scale
@@ -158,6 +163,30 @@ def get_adjusted_image() -> Image.Image:
     return img
 
 
+def build_polygon_preview(image: Image.Image, polygon: list[tuple[float, float]]) -> Image.Image:
+    """Render a simple translucent boundary overlay for AI-detected roof polygons."""
+    preview = image.convert("RGBA")
+    overlay = Image.new("RGBA", preview.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay, "RGBA")
+
+    if len(polygon) >= 3:
+        draw.polygon(polygon, fill=(59, 130, 246, 60), outline=(59, 130, 246, 220))
+
+    for i, pt in enumerate(polygon):
+        r = 6
+        draw.ellipse([pt[0] - r, pt[1] - r, pt[0] + r, pt[1] + r], fill=(59, 130, 246, 255))
+        draw.text((pt[0] + 10, pt[1] - 10), str(i + 1), fill=(255, 255, 255, 255))
+
+    return Image.alpha_composite(preview, overlay).convert("RGB")
+
+
+def get_active_roof_polygon() -> list[tuple[float, float]]:
+    """Return the confirmed roof boundary, falling back to a pending AI boundary only before confirmation."""
+    if st.session_state.get("roof_points"):
+        return st.session_state["roof_points"]
+    return st.session_state.get("pending_ai_roof_points", [])
+
+
 def bump_canvas():
     """Reset the canvas by bumping its key."""
     st.session_state["canvas_key"] += 1
@@ -184,6 +213,111 @@ with st.sidebar:
         st.session_state["image"] = img
         st.session_state["step"] = 2
         st.rerun()
+
+    if uploaded is not None:
+        base_image = Image.open(uploaded)
+    
+    # Let users choose between manual canvas tracing and automatic AI mapping
+    input_mode = st.radio(
+        "Select Boundary Identification Method:",
+        ["AI Automated Segmentation", "Manual Canvas Drawing Interface"]
+    )
+    
+    # Global holder variable for our optimization coordinate targets
+    active_roof_polygon = []
+    
+    if input_mode == "AI Automated Segmentation":
+        if uploaded is None:
+            st.info("Upload an image first, then click 'Analyze Rooftop Architecture with AI'.")
+        else:
+            st.session_state["rf_confidence_threshold"] = st.slider(
+                "Roboflow confidence threshold",
+                min_value=1,
+                max_value=100,
+                value=st.session_state["rf_confidence_threshold"],
+                step=1,
+                help="Lower values show more candidate roof boundaries. Higher values keep only stronger predictions.",
+            )
+            # Add an explicit action invoke button
+            if st.button("🚀 Analyze Rooftop Architecture with AI"):
+                with st.spinner("Streaming image payload to Roboflow models..."):
+                    detected_facets = segment_roof_facets(
+                        base_image,
+                        confidence_threshold=st.session_state["rf_confidence_threshold"],
+                    )
+                    # Keep values inside session state cache so it doesn't drop on widget adjustments
+                    st.session_state["cached_facets"] = detected_facets
+        
+        cached_facets = st.session_state.get("cached_facets", [])
+        
+        if cached_facets:
+            st.success(f"Identified {len(cached_facets)} distinct structural plane facets!")
+
+            if st.session_state.get("roof_points"):
+                st.success("Roof boundary confirmed. You can proceed to Step 3 and Step 7.")
+                st.caption("Use the selected AI facet only if you want to change the confirmed boundary.")
+
+            cached_facets = sorted(
+                cached_facets,
+                key=lambda facet: (facet.get("confidence", 0.0), len(facet.get("polygon", []))),
+                reverse=True,
+            )
+            best_facet = cached_facets[0]
+            
+            # Generate descriptive readable selections from your target classes
+            facet_labels = [
+                f"Plane #{i} — Category: {f['class'].upper()} (Conf: {f['confidence']:.1%}, Vertices: {len(f.get('polygon', []))})"
+                for i, f in enumerate(cached_facets)
+            ]
+            
+            selected_facet_idx = st.selectbox(
+                "Choose target facet area to overlay PV Array grid layout:",
+                range(len(facet_labels)),
+                format_func=lambda x: facet_labels[x],
+                index=0,
+            )
+            
+            # Map selected AI polygon out into active optimization variables
+            selected_facet = cached_facets[selected_facet_idx]
+            raw_polygon = selected_facet["polygon"]
+            active_roof_polygon = simplify_polygon(raw_polygon, epsilon=8.0)
+            st.session_state["pending_ai_roof_points"] = active_roof_polygon
+            st.session_state["ai_boundary_selected"] = True
+            st.session_state["step"] = max(st.session_state["step"], 4)
+
+            st.markdown(
+                f"**Selected facet:** {selected_facet['class'].upper()}  |  Confidence: {selected_facet['confidence']:.1%}"
+            )
+            st.caption(f"Boundary simplified from {len(raw_polygon)} to {len(active_roof_polygon)} points for optimization.")
+            if selected_facet == best_facet:
+                st.caption("Suggested boundary selected by default based on confidence and polygon size.")
+            else:
+                st.caption("Select a different boundary if another prediction better matches the roof edge.")
+
+            if st.button("✅ Confirm Roof Boundary"):
+                st.session_state["roof_points"] = st.session_state["pending_ai_roof_points"][:]
+                st.session_state["pending_ai_roof_points"] = []
+                st.session_state["ai_boundary_selected"] = False
+                st.session_state["result"] = None
+                st.session_state["step"] = max(st.session_state["step"], 4)
+                st.rerun()
+        else:
+            st.info("Upload image and click 'Analyze Rooftop Architecture' above to isolate bounds.")
+            
+    else:
+        # ── This is where your original manual canvas drawing code remains ──
+        # Extract points drawn via your original `st_canvas` mechanism
+        # E.g., active_roof_polygon = parse_canvas_points(canvas_result)
+        st.warning("Manual drawing mode active. Draw your polygon layout on the interactive window.")
+
+    # ── AI boundary output is stored in shared state and optimized from Step 7 ──
+    if active_roof_polygon:
+        pixels_per_meter = st.session_state.get("pixels_per_meter")
+        st.markdown("### ⚡ AI Boundary Detected")
+        if not pixels_per_meter or pixels_per_meter <= 0:
+            st.info("AI boundary is ready. Set the scale in Step 3, then run optimization in Step 7.")
+        else:
+            st.info("AI boundary is ready. You can now run optimization in Step 7.")
 
     st.divider()
 
@@ -455,9 +589,17 @@ with st.sidebar:
     # ── Step 7: Optimize ─────────────────────────────────────────────────────
     st.markdown('<span class="step-badge">7</span> **Optimize**', unsafe_allow_html=True)
 
+    # Allow optimization when either a confirmed roof (`roof_points`) exists
+    # or when an AI-detected boundary is available in `pending_ai_roof_points`.
+    selected_roof_points = (
+        st.session_state.get("roof_points")
+        or st.session_state.get("pending_ai_roof_points")
+        or []
+    )
+
     can_optimize = (
         st.session_state["image"] is not None
-        and len(st.session_state["roof_points"]) >= 3
+        and len(selected_roof_points) >= 3
         and st.session_state["pixels_per_meter"] is not None
         and st.session_state["pixels_per_meter"] > 0
     )
@@ -468,7 +610,8 @@ with st.sidebar:
             custom_psh = st.session_state["custom_psh"] if st.session_state["use_custom_psh"] else None
 
             result = optimize_layout(
-                roof_points=st.session_state["roof_points"],
+                # Use the confirmed roof if available, otherwise the AI-pending polygon.
+                roof_points=selected_roof_points,
                 obstacles=[
                     {"x": o["x"], "y": o["y"], "width": o["width"], "height": o["height"]}
                     for o in st.session_state["obstacles"]
@@ -490,8 +633,8 @@ with st.sidebar:
         missing = []
         if st.session_state["image"] is None:
             missing.append("Upload image")
-        if len(st.session_state["roof_points"]) < 3:
-            missing.append(f"Draw boundary ({len(st.session_state['roof_points'])}/3+ points)")
+        if len(selected_roof_points) < 3:
+            missing.append(f"Draw boundary ({len(selected_roof_points)}/3+ points)")
         if not st.session_state["pixels_per_meter"]:
             missing.append("Set scale")
         st.warning("Missing: " + ", ".join(missing))
@@ -532,12 +675,15 @@ else:
     # Prepare the display image
     display_img = get_adjusted_image() if st.session_state["step"] <= 2 else st.session_state["image"]
 
+    if st.session_state.get("cached_facets") and (st.session_state["roof_points"] or st.session_state.get("pending_ai_roof_points")):
+        st.success("AI rooftop boundary is shown directly on the main dashboard image below.")
+
     # ── Create annotated background with existing points ────────────────────
     annotated = display_img.copy()
     draw = ImageDraw.Draw(annotated, "RGBA")
 
     # Draw roof boundary polygon
-    roof_pts = st.session_state["roof_points"]
+    roof_pts = get_active_roof_polygon()
     if len(roof_pts) >= 2:
         for i in range(len(roof_pts)):
             p1 = roof_pts[i]

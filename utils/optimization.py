@@ -2,6 +2,7 @@
 Panel placement optimization algorithm.
 Grid-based placement with offset trials for maximum packing.
 """
+import time
 from typing import List, Tuple, Dict, Any
 from .models import PlacedPanel, Obstacle, OptimizationResult, LocationData
 from .irradiance import DEFAULT_PANEL_SPEC, calculate_yield, GRID_EMISSION_FACTOR, AVG_TARIFF_RM
@@ -11,6 +12,7 @@ from .geometry import (
     polygon_area,
     bounding_box,
     inset_polygon,
+    simplify_polygon,
 )
 
 
@@ -40,6 +42,16 @@ def optimize_layout(
     spec = panel_spec or DEFAULT_PANEL_SPEC
     ppm = pixels_per_meter
 
+    if ppm is None or ppm <= 0:
+        raise ValueError("Pixels-per-meter scale must be greater than zero.")
+
+    if len(roof_points) < 3:
+        raise ValueError("Roof boundary must contain at least 3 points.")
+
+    # Keep optimization predictable even when boundaries come from dense AI contours.
+    if len(roof_points) > 120:
+        roof_points = simplify_polygon(roof_points, epsilon=6.0)
+
     # Panel dimensions in metres
     panel_len_m = spec["length_mm"] / 1000
     panel_wid_m = spec["width_mm"] / 1000
@@ -63,6 +75,9 @@ def optimize_layout(
     step_x = panel_w_px + col_gap_px
     step_y = panel_h_px + row_gap_px
 
+    if step_x <= 0 or step_y <= 0:
+        raise ValueError("Invalid panel/grid spacing. Check scale and gap settings.")
+
     # Expand obstacles by gap so panels maintain clearance
     expanded_obs = []
     for o in obstacles:
@@ -76,6 +91,21 @@ def optimize_layout(
     # Try several grid offsets for best packing
     best_panels: List[PlacedPanel] = []
     trials = 6
+    max_grid_checks = 120000
+    grid_checks = 0
+    max_runtime_seconds = 8.0
+    start_time = time.perf_counter()
+
+    # Pre-flight complexity check to fail fast before expensive polygon tests.
+    width_px = max(0.0, bb["max_x"] - bb["min_x"])
+    height_px = max(0.0, bb["max_y"] - bb["min_y"])
+    est_cols = int(width_px / step_x) + 1
+    est_rows = int(height_px / step_y) + 1
+    est_checks = est_cols * est_rows * trials * trials
+    if est_checks > max_grid_checks:
+        raise ValueError(
+            "Optimization grid is too dense for current scale/settings. Increase pixels-per-meter, increase known scale distance, or increase gaps/setback."
+        )
 
     for oy in range(trials):
         for ox in range(trials):
@@ -89,6 +119,15 @@ def optimize_layout(
                 x = sx
                 col = 0
                 while x + panel_w_px <= bb["max_x"] + 0.5:
+                    if time.perf_counter() - start_time > max_runtime_seconds:
+                        raise ValueError(
+                            "Optimization timed out. Try increasing scale (px/m), simplifying boundary, or increasing panel gaps/setback."
+                        )
+                    grid_checks += 1
+                    if grid_checks > max_grid_checks:
+                        raise ValueError(
+                            "Grid search too dense for the current scale. Increase pixels-per-meter or reduce image complexity."
+                        )
                     # Check inside polygon
                     if rect_inside_polygon(x, y, panel_w_px, panel_h_px, usable_poly):
                         # Check obstacles
